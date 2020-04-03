@@ -28,39 +28,88 @@
 extern crate log;
 
 use std::net::ToSocketAddrs;
+use std::pin::Pin;
 
+use quiche::Connection;
 use ring::rand::*;
+use url::Url;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-
 const STREAM_ID: u64 = 4;
 
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
         .init();
-    let mut buf = [0; 65535];
-    let mut out = [0; MAX_DATAGRAM_SIZE];
-
-    let mut args = std::env::args();
-
-    let cmd = &args.next().unwrap();
-
-    if args.len() != 1 {
-        println!("Usage: {} URL", cmd);
-        println!("\nSee tools/apps/ for more complete implementations.");
-        return;
-    }
-
+    let mut args = get_args();
     let url = url::Url::parse(&args.next().unwrap()).unwrap();
+    let socket = create_sock(&url);
+    let poll = create_poll(&socket);
+    let mut conn = create_conn(&url);
 
-    // Setup the event loop.
-    let poll = mio::Poll::new().unwrap();
+    establish_conn(&socket, &mut conn, &poll);
+    send_msg(&socket, &mut conn);
+    recv_msg(&socket, &mut conn, &poll);
+    close_conn(&mut conn);
+}
+
+fn get_args() -> std::env::Args {
+    let mut args = std::env::args();
+    let cmd = &args.next().unwrap();
+    if args.len() != 1 {
+        panic!("Usage: {} URL", cmd);
+    }
+    args
+}
+
+fn establish_conn(socket: &mio::net::UdpSocket, conn: &mut Pin<Box<Connection>>, poll: &mio::Poll) {
+    info!("Establishing connection...");
+    // send initial packet
+    quicson::send(socket, conn);
     let mut events = mio::Events::with_capacity(1024);
+    while !conn.is_established() {
+        poll.poll(&mut events, conn.timeout()).unwrap();
+        quicson::recv(&socket, conn, &events);
+        quicson::send(&socket, conn);
+    }
+    info!("Connection established");
+}
 
-    // Resolve server address.
+fn send_msg(socket: &mio::net::UdpSocket, conn: &mut Pin<Box<Connection>>) {
+    info!("Sending Hello");
+    conn.stream_send(STREAM_ID, b"Hello from client", true).unwrap();
+    quicson::send(&socket, conn);
+}
+
+fn recv_msg(socket: &mio::net::UdpSocket, conn: &mut Pin<Box<Connection>>, poll: &mio::Poll) {
+    let mut events = mio::Events::with_capacity(1024);
+    poll.poll(&mut events, conn.timeout()).unwrap();
+    quicson::recv(socket, conn, &events);
+    proc_streams(conn);
+    quicson::send(&socket, conn);
+}
+
+fn close_conn(conn: &mut Pin<Box<Connection>>) {
+    info!("Closing connection");
+    conn.close(true, 0x00, b"kthxbye").unwrap();
+    info!("Connection closed {:?}", conn.stats());
+}
+
+fn proc_streams(conn: &mut Pin<Box<quiche::Connection>>) {
+    let mut buf = [0; 65535];
+    for s in conn.readable() {
+        while let Ok((read, fin)) = conn.stream_recv(s, &mut buf) {
+            debug!("received {} bytes", read);
+            let stream_buf = &buf[..read];
+            debug!("stream {} has {} bytes (fin? {})", s, stream_buf.len(), fin);
+            let msg = String::from_utf8(stream_buf.to_vec()).unwrap();
+            info!("got msg: {}", msg);
+        }
+    }
+}
+
+fn create_sock(url: &Url) -> mio::net::UdpSocket {
     let peer_addr = url.to_socket_addrs().unwrap().next().unwrap();
-
     // Bind to INADDR_ANY or IN6ADDR_ANY depending on the IP family of the
     // server address. This is needed on macOS and BSD variants that don't
     // support binding to IN6ADDR_ANY for both v4 and v6.
@@ -68,33 +117,31 @@ fn main() {
         std::net::SocketAddr::V4(_) => "0.0.0.0:0",
         std::net::SocketAddr::V6(_) => "[::]:0",
     };
-
-    // Create the UDP socket backing the QUIC connection, and register it with
-    // the event loop.
     let socket = std::net::UdpSocket::bind(bind_addr).unwrap();
     socket.connect(peer_addr).unwrap();
-
     let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
+    info!("local addr: {:}, peer addr: {:}", socket.local_addr().unwrap(), peer_addr);
+    socket
+}
+
+fn create_poll(socket: &mio::net::UdpSocket) -> mio::Poll {
+    let poll = mio::Poll::new().unwrap();
     poll.register(
-        &socket,
+        socket,
         mio::Token(0),
         mio::Ready::readable(),
         mio::PollOpt::edge(),
     )
     .unwrap();
+    poll
+}
 
-    // Create the configuration for the QUIC connection.
+fn create_conn(url: &Url) -> Pin<Box<Connection>> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-
-    // *CAUTION*: this should not be set to `false` in production!!!
-    config.verify_peer(false);
-
+    config.verify_peer(false); // do not set this in production
     config
-        .set_application_protos(
-            b"\x05hq-27\x05hq-25\x05hq-24\x05hq-23\x08http/0.9",
-        )
+        .set_application_protos(b"\x05hq-27\x05hq-25\x05hq-24\x05hq-23\x08http/0.9")
         .unwrap();
-
     config.set_max_idle_timeout(5000);
     config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);
     config.set_initial_max_data(10_000_000);
@@ -104,171 +151,8 @@ fn main() {
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
 
-    // Generate a random source connection ID for the connection.
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
     SystemRandom::new().fill(&mut scid[..]).unwrap();
-
-    // Create a QUIC connection and initiate handshake.
-    let mut conn = quiche::connect(url.domain(), &scid, &mut config).unwrap();
-
-    info!(
-        "connecting to {:} from {:} with scid {}",
-        peer_addr,
-        socket.local_addr().unwrap(),
-        hex_dump(&scid)
-    );
-
-    let write = conn.send(&mut out).expect("initial send failed");
-
-    while let Err(e) = socket.send(&out[..write]) {
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            debug!("send() would block");
-            continue;
-        }
-
-        panic!("send() failed: {:?}", e);
-    }
-
-    debug!("written {}", write);
-
-    let msg_start = std::time::Instant::now();
-
-    let mut msg_sent = false;
-
-    loop {
-        poll.poll(&mut events, conn.timeout()).unwrap();
-
-        // Read incoming UDP packets from the socket and feed them to quiche,
-        // until there are no more packets to read.
-        'read: loop {
-            // If the event loop reported no events, it means that the timeout
-            // has expired, so handle it without attempting to read packets. We
-            // will then proceed with the send loop.
-            if events.is_empty() {
-                debug!("timed out");
-
-                conn.on_timeout();
-                break 'read;
-            }
-
-            let len = match socket.recv(&mut buf) {
-                Ok(v) => v,
-
-                Err(e) => {
-                    // There are no more UDP packets to read, so end the read
-                    // loop.
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        debug!("recv() would block");
-                        break 'read;
-                    }
-
-                    panic!("recv() failed: {:?}", e);
-                },
-            };
-
-            debug!("got {} bytes", len);
-            
-
-            // Process potentially coalesced packets.
-            let read = match conn.recv(&mut buf[..len]) {
-                Ok(v) => v,
-
-                Err(quiche::Error::Done) => {
-                    debug!("done reading");
-                    break;
-                },
-
-                Err(e) => {
-                    error!("recv failed: {:?}", e);
-                    break 'read;
-                },
-            };
-
-            debug!("processed {} bytes", read);
-        }
-
-        if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
-            break;
-        }
-
-        if conn.is_established() && !msg_sent {
-            info!("sending Hello");
-            conn.stream_send(STREAM_ID, b"Hello from client", true)
-                .unwrap();
-
-            msg_sent = true;
-        }
-
-        // Process all readable streams.
-        for s in conn.readable() {
-            while let Ok((read, fin)) = conn.stream_recv(s, &mut buf) {
-                debug!("received {} bytes", read);
-
-                let stream_buf = &buf[..read];
-
-                debug!(
-                    "stream {} has {} bytes (fin? {})",
-                    s,
-                    stream_buf.len(),
-                    fin
-                );
-
-                info!("got msg: {}", String::from_utf8(stream_buf.to_vec()).unwrap());
-
-                // The server reported that it has no more data to send, which
-                // we got the full response. Close the connection.
-                if s == STREAM_ID && fin {
-                    info!(
-                        "response received in {:?}, closing...",
-                        msg_start.elapsed()
-                    );
-
-                    conn.close(true, 0x00, b"kthxbye").unwrap();
-                }
-            }
-        }
-
-        // Generate outgoing QUIC packets and send them on the UDP socket, until
-        // quiche reports that there are no more packets to be sent.
-        loop {
-            let write = match conn.send(&mut out) {
-                Ok(v) => v,
-
-                Err(quiche::Error::Done) => {
-                    debug!("done writing");
-                    break;
-                },
-
-                Err(e) => {
-                    error!("send failed: {:?}", e);
-
-                    conn.close(false, 0x1, b"fail").ok();
-                    break;
-                },
-            };
-
-            if let Err(e) = socket.send(&out[..write]) {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    debug!("send() would block");
-                    break;
-                }
-
-                panic!("send() failed: {:?}", e);
-            }
-
-            debug!("written {}", write);
-        }
-
-        if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
-            break;
-        }
-    }
-}
-
-fn hex_dump(buf: &[u8]) -> String {
-    let vec: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
-
-    vec.join("")
+    info!("scid: {}", quicson::hex_dump(&scid));
+    quiche::connect(url.domain(), &scid, &mut config).unwrap()
 }

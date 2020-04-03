@@ -1,5 +1,5 @@
 [package]
-name = "quickson"
+name = "quicson"
 version = "0.1.0"
 authors = ["Michał Śledź <sledzson08@gmail.com>"]
 edition = "2018"
