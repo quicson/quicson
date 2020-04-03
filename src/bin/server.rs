@@ -321,7 +321,7 @@ fn main() {
                             fin
                         );
 
-                        handle_stream(client, s, stream_buf, "examples/root");
+                        handle_stream(client, s, stream_buf);
                     }
                 }
             }
@@ -438,55 +438,22 @@ fn validate_token<'a>(
 }
 
 /// Handles incoming HTTP/0.9 requests.
-fn handle_stream(client: &mut Client, stream_id: u64, buf: &[u8], root: &str) {
+fn handle_stream(client: &mut Client, stream_id: u64, buf: &[u8]) {
     let conn = &mut client.conn;
 
-    if buf.len() > 4 && &buf[..4] == b"GET " {
-        let uri = &buf[4..buf.len()];
-        let uri = String::from_utf8(uri.to_vec()).unwrap();
-        let uri = String::from(uri.lines().next().unwrap());
-        let uri = std::path::Path::new(&uri);
-        let mut path = std::path::PathBuf::from(root);
+    let msg = String::from_utf8(buf.to_vec()).unwrap();
+    info!("got msg: {} on stream {}", msg, stream_id);
+    info!("sending hello from server");
+    match conn.stream_send(stream_id, b"hello from server", true) {
+        Ok(v) => v,
 
-        for c in uri.components() {
-            if let std::path::Component::Normal(v) = c {
-                path.push(v)
-            }
-        }
+        Err(quiche::Error::Done) => 0,
 
-        info!(
-            "{} got GET request for {:?} on stream {}",
-            conn.trace_id(),
-            path,
-            stream_id
-        );
-
-        let body = std::fs::read(path.as_path())
-            .unwrap_or_else(|_| b"Not Found!\r\n".to_vec());
-
-        info!(
-            "{} sending response of size {} on stream {}",
-            conn.trace_id(),
-            body.len(),
-            stream_id
-        );
-
-        let written = match conn.stream_send(stream_id, &body, true) {
-            Ok(v) => v,
-
-            Err(quiche::Error::Done) => 0,
-
-            Err(e) => {
-                error!("{} stream send failed {:?}", conn.trace_id(), e);
-                return;
-            },
-        };
-
-        if written < body.len() {
-            let response = PartialResponse { body, written };
-            client.partial_responses.insert(stream_id, response);
-        }
-    }
+        Err(e) => {
+            error!("{} stream send failed {:?}", conn.trace_id(), e);
+            return;
+        },
+    };
 }
 
 /// Handles newly writable streams.

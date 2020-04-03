@@ -33,7 +33,7 @@ use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-const HTTP_REQ_STREAM_ID: u64 = 4;
+const STREAM_ID: u64 = 4;
 
 fn main() {
     env_logger::builder()
@@ -131,9 +131,9 @@ fn main() {
 
     debug!("written {}", write);
 
-    let req_start = std::time::Instant::now();
+    let msg_start = std::time::Instant::now();
 
-    let mut req_sent = false;
+    let mut msg_sent = false;
 
     loop {
         poll.poll(&mut events, conn.timeout()).unwrap();
@@ -192,15 +192,12 @@ fn main() {
             break;
         }
 
-        // Send an HTTP request as soon as the connection is established.
-        if conn.is_established() && !req_sent {
-            info!("sending HTTP request for {}", url.path());
-
-            let req = format!("GET {}\r\n", url.path());
-            conn.stream_send(HTTP_REQ_STREAM_ID, req.as_bytes(), true)
+        if conn.is_established() && !msg_sent {
+            info!("sending Hello");
+            conn.stream_send(STREAM_ID, b"Hello from client", true)
                 .unwrap();
 
-            req_sent = true;
+            msg_sent = true;
         }
 
         // Process all readable streams.
@@ -217,16 +214,14 @@ fn main() {
                     fin
                 );
 
-                print!("{}", unsafe {
-                    std::str::from_utf8_unchecked(&stream_buf)
-                });
+                info!("got msg: {}", String::from_utf8(stream_buf.to_vec()).unwrap());
 
                 // The server reported that it has no more data to send, which
                 // we got the full response. Close the connection.
-                if s == HTTP_REQ_STREAM_ID && fin {
+                if s == STREAM_ID && fin {
                     info!(
                         "response received in {:?}, closing...",
-                        req_start.elapsed()
+                        msg_start.elapsed()
                     );
 
                     conn.close(true, 0x00, b"kthxbye").unwrap();
