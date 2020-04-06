@@ -44,13 +44,13 @@ fn main() {
     let mut args = get_args();
     let url = url::Url::parse(&args.next().unwrap()).unwrap();
     let socket = create_sock(&url);
-    let poll = create_poll(&socket);
+    let poll = quicson::create_poll(&socket);
     let mut conn = create_conn(&url);
 
     establish_conn(&socket, &mut conn, &poll);
     send_msg(&socket, &mut conn);
     recv_msg(&socket, &mut conn, &poll);
-    close_conn(&mut conn);
+    quicson::close_conn(&mut conn);
 }
 
 fn get_args() -> std::env::Args {
@@ -73,6 +73,9 @@ fn establish_conn(socket: &mio::net::UdpSocket, conn: &mut Pin<Box<Connection>>,
         quicson::send(&socket, conn);
     }
     info!("Connection established");
+    // TODO: why do I need these two lines below?
+    poll.poll(&mut events, conn.timeout()).unwrap();
+    quicson::recv(&socket, conn, &events);
 }
 
 fn send_msg(socket: &mio::net::UdpSocket, conn: &mut Pin<Box<Connection>>) {
@@ -85,27 +88,8 @@ fn recv_msg(socket: &mio::net::UdpSocket, conn: &mut Pin<Box<Connection>>, poll:
     let mut events = mio::Events::with_capacity(1024);
     poll.poll(&mut events, conn.timeout()).unwrap();
     quicson::recv(socket, conn, &events);
-    proc_streams(conn);
+    quicson::read_streams(conn);
     quicson::send(&socket, conn);
-}
-
-fn close_conn(conn: &mut Pin<Box<Connection>>) {
-    info!("Closing connection");
-    conn.close(true, 0x00, b"kthxbye").unwrap();
-    info!("Connection closed {:?}", conn.stats());
-}
-
-fn proc_streams(conn: &mut Pin<Box<quiche::Connection>>) {
-    let mut buf = [0; 65535];
-    for s in conn.readable() {
-        while let Ok((read, fin)) = conn.stream_recv(s, &mut buf) {
-            debug!("received {} bytes", read);
-            let stream_buf = &buf[..read];
-            debug!("stream {} has {} bytes (fin? {})", s, stream_buf.len(), fin);
-            let msg = String::from_utf8(stream_buf.to_vec()).unwrap();
-            info!("got msg: {}", msg);
-        }
-    }
 }
 
 fn create_sock(url: &Url) -> mio::net::UdpSocket {
@@ -122,18 +106,6 @@ fn create_sock(url: &Url) -> mio::net::UdpSocket {
     let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
     info!("local addr: {:}, peer addr: {:}", socket.local_addr().unwrap(), peer_addr);
     socket
-}
-
-fn create_poll(socket: &mio::net::UdpSocket) -> mio::Poll {
-    let poll = mio::Poll::new().unwrap();
-    poll.register(
-        socket,
-        mio::Token(0),
-        mio::Ready::readable(),
-        mio::PollOpt::edge(),
-    )
-    .unwrap();
-    poll
 }
 
 fn create_conn(url: &Url) -> Pin<Box<Connection>> {
