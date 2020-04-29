@@ -7,6 +7,7 @@ use mio::Poll;
 use ring::rand::{SystemRandom, SecureRandom};
 use std::pin::Pin;
 use std::net::SocketAddr;
+use std::error::Error;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -70,8 +71,8 @@ fn create_sock(ip: &str) -> mio::net::UdpSocket {
 
 fn create_conf() -> Config {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-    config.load_cert_chain_from_pem_file("cert.crt").unwrap();
-    config.load_priv_key_from_pem_file("cert.key").unwrap();
+    config.load_cert_chain_from_pem_file("cert.pem").unwrap();
+    config.load_priv_key_from_pem_file("key.pem").unwrap();
     config.set_application_protos(b"\x05hq-27").unwrap();
     config.set_max_idle_timeout(5000);
     config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);

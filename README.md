@@ -1,4 +1,4 @@
-# ![alt-text](./qs.png) quicson
+# quicson
 
 This is a simple [quic](https://tools.ietf.org/html/draft-ietf-quic-transport-27) client-server example written by 
 [cloudflare](https://github.com/cloudflare/quiche/tree/master/examples) and modified on my own.
